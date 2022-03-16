@@ -1,1 +1,168 @@
+# Import Library
+import numpy as np
+import pandas as pd
 
+import seaborn as sns
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+import cv2
+from PIL import Image
+
+import tensorflow as tf
+from keras import layers
+from tensorflow.keras import applications 
+from keras.applications import MobileNetV2
+from keras.callbacks import Callback, ModelCheckpoint
+from keras.preprocessing.image import ImageDataGenerator
+from keras.models import Sequential, load_model
+from keras.optimizers import Adam
+from keras import models
+
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import cohen_kappa_score, accuracy_score, confusion_matrix
+
+from tqdm import tqdm
+
+# read dataset 
+
+train_df = pd.read_csv('../input/valid-and-test-ta/x_train_8.csv')
+valid_df = pd.read_csv('../input/valid-and-test-ta/x_valid_8.csv')
+print(train_df.shape)
+print(valid_df.shape)
+train_df.head()
+
+train_df['diagnosis'].value_counts()
+
+train_df['diagnosis'].hist()
+
+## Explore Images (optional)
+
+def display_samples(df, columns=4, rows=3):
+    fig=plt.figure(figsize=(5*columns, 4*rows))
+
+    for i in range(columns*rows):
+        image_path = df.loc[i,'id_code']
+        image_id = df.loc[i,'diagnosis']
+        img = cv2.imread(f'../input/aptos2019-blindness-detection/train_images/{image_path}.png')
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        fig.add_subplot(rows, columns, i+1)
+        plt.title(image_id)
+        plt.imshow(img)
+    
+    plt.tight_layout()
+
+display_samples(train_df)
+
+# Resampling Dataset to make better Accuracy
+from sklearn.utils import resample
+X=train_df
+normal=X[X.diagnosis==0]
+mild=X[X.diagnosis==1]
+moderate=X[X.diagnosis==2]
+severe=X[X.diagnosis==3]
+pdr=X[X.diagnosis==4]
+
+train_df_original = pd.concat([normal, mild, moderate, severe, pdr])
+
+#downsampled
+mild = resample(mild,
+                replace=True, # sample with replacement
+                n_samples=700, # match number in majority class
+                random_state=2020) # reproducible results
+moderate = resample(moderate,
+                    replace=False, # sample with replacement
+                    n_samples=700, # match number in majority class
+                    random_state=2020) # reproducible results
+severe = resample(severe,
+                  replace=True, # sample with replacement
+                  n_samples=700, # match number in majority class
+                  random_state=2020) # reproducible results
+normal = resample(normal,
+                  replace=False, # sample with replacement
+                  n_samples=700, # match number in majority class
+                  random_state=2020) # reproducible results
+pdr = resample(pdr,
+               replace=True, # sample with replacement
+               n_samples=700, # match number in majority class
+               random_state=2020) # reproducible results    
+
+# combine minority and downsampled majority
+sampled = pd.concat([normal, mild, moderate, severe, pdr])
+
+# checking counts
+sampled.diagnosis.value_counts()
+
+train_df = sampled
+train_df = train_df.sample(frac=1).reset_index(drop=True)
+def preprocess_image(image_path, desired_size=240):
+    im = Image.open(image_path)
+    im = im.resize((desired_size, )*2, resample=Image.BILINEAR)
+    
+    return im
+    
+   # Spliting Dataset for Training
+
+N = train_df.shape[0]
+
+# train data
+x_train = np.empty((N, 240, 240, 3), dtype=np.float32)
+
+for i, image_id in enumerate(tqdm(train_df['id_code'])):
+    x_train[i, :, :, :] = preprocess_image(
+        f'../input/aptos2019-blindness-detection/train_images/{image_id}.png')
+    
+# Validation data / test data    
+N = valid_df.shape[0]
+x_val = np.empty((N, 240, 240, 3), dtype=np.float32)
+
+for i, image_id in enumerate(tqdm(valid_df['id_code'])):
+    x_val[i, :, :, :] = preprocess_image(
+        f'../input/aptos2019-blindness-detection/train_images/{image_id}.png')
+    
+y_train = train_df['diagnosis']
+y_val = valid_df['diagnosis']
+print(x_train.shape)
+print(y_train.shape)
+print(x_val.shape)
+print(y_val.shape) 
+
+# Define metrics for Classification
+
+class Metrics(Callback):
+    def __init__(self, xval, yval):
+        super().__init__()
+        self.xval = xval
+        self.yval = yval
+        
+    def on_train_begin(self, logs={}):
+        self.val_kappas = []
+
+    def on_epoch_end(self, epoch, logs={}):
+        X_val = self.xval
+        y_val = self.yval
+        
+        y_pred = self.model.predict(X_val)
+        y_pred = np.clip(y_pred,0,4)
+        y_pred = y_pred.astype(int)
+
+        _val_kappa = cohen_kappa_score(
+            y_val,
+            y_pred, 
+            weights='quadratic'
+        )
+
+        self.val_kappas.append(_val_kappa)
+
+        print(f"val_kappa: {_val_kappa:.4f}")
+        
+        if _val_kappa == max(self.val_kappas):
+            print("Validation Kappa has improved. Saving model.")
+            self.model.save('model_0.h5')
+
+        return
+    
+    
+kappa_metrics = Metrics(x_val, y_val)
